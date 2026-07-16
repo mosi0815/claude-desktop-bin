@@ -775,7 +775,12 @@ proc apply*(input: string): string =
   echo "  --- Tool description patches ---"
   var descChanges = 0
 
-  # 13a: Lf allowlist gate → empty on Linux
+  # 13a: Lf allowlist gate → empty on regular-mode Linux only.
+  # kwin-wayland mode falls through to upstream's handleToolCall (Patch 6 gates
+  # the hybrid handler with !__cuKwinMode), so the frontmost-allowlist rule IS
+  # enforced there — blanking the sentence would leave the model unwarned about
+  # rejections it will actually hit. Only the regular executor (handler
+  # injection, no enforcement) gets the empty string.
   block:
     let pat =
       re"""([\w$]+)="The frontmost application must be in the session allowlist at the time of this call, or this tool returns an error and does nothing\.""""
@@ -784,10 +789,10 @@ proc apply*(input: string): string =
       pat,
       proc(m: RegexMatch): string =
         let v = m.captures[0]
-        &"{v}=process.platform===\"linux\"?\"\":\"The frontmost application must be in the session allowlist at the time of this call, or this tool returns an error and does nothing.\"",
+        &"{v}=process.platform===\"linux\"&&!globalThis.__cuKwinMode?\"\":\"The frontmost application must be in the session allowlist at the time of this call, or this tool returns an error and does nothing.\"",
     )
     if n >= 1:
-      echo "  [OK] 13a Lf allowlist gate: empty on Linux"
+      echo "  [OK] 13a Lf allowlist gate: empty on Linux (regular mode; kwin keeps upstream)"
       inc descChanges
       inc patchesApplied
     else:
@@ -939,39 +944,71 @@ proc apply*(input: string): string =
     else:
       echo "  [FAIL] 13b.kwin-shell-detect desktop shell detection: not found"
 
-  # 13c: request_access apps — WM_CLASS for Linux
+  # 13c: request_access apps — 3-way. kwin mode resolves display names /
+  # desktop-entry ids via list-installed-apps and grants are REAL (ungranted
+  # apps are hidden from capture), so it must not claim auto-grant or teach
+  # WM_CLASS jargon. Regular mode keeps the auto-grant wording (true there).
   block:
     let old13c =
       """'Application display names (e.g. "Slack", "Calendar") or bundle identifiers (e.g. "com.tinyspeck.slackmacgap"). Display names are resolved case-insensitively against installed apps.'"""
     let new13c =
-      "(process.platform===\"linux\"?" &
+      "(process.platform===\"linux\"?(globalThis.__cuKwinMode?" &
+      "'Application display names (e.g. \"KCalc\") or desktop-entry ids " &
+      "(e.g. \"org.kde.kcalc\"). Display names are resolved case-insensitively " &
+      "against installed apps.'" & ":" &
       "'Application names as shown in window titles, or WM_CLASS values " &
       "(e.g. \"firefox\", \"org.gnome.Nautilus\"). " &
-      "On Linux all apps are auto-granted at full tier.'" & ":" &
+      "On Linux all apps are auto-granted at full tier.')" & ":" &
       "'Application display names (e.g. \"Slack\", \"Calendar\") or bundle " &
       "identifiers (e.g. \"com.tinyspeck.slackmacgap\"). Display names are " &
       "resolved case-insensitively against installed apps.')"
     if replaceLiteralFirst(content, old13c, new13c) == 1:
-      echo "  [OK] 13c request_access apps: Linux identifiers"
+      echo "  [OK] 13c request_access apps: 3-way (kwin=desktop-entry ids, regular=WM_CLASS/auto-grant)"
       inc descChanges
       inc patchesApplied
     else:
       echo "  [FAIL] 13c request_access apps: not found"
 
-  # 13d: open_application app identifier
+  # 13d: open_application app identifier — 3-way (kwin resolves display names /
+  # desktop-entry ids with alias suggestions, not WM_CLASS).
   block:
     let old13d =
       """'Display name (e.g. "Slack") or bundle identifier (e.g. "com.tinyspeck.slackmacgap").'"""
     let new13d =
-      "(process.platform===\"linux\"?" &
-      "'Application name or WM_CLASS (e.g. \"firefox\", \"nautilus\").'" & ":" &
+      "(process.platform===\"linux\"?(globalThis.__cuKwinMode?" &
+      "'Application name or desktop-entry id (e.g. \"firefox\", \"org.kde.kcalc\").'" & ":" &
+      "'Application name or WM_CLASS (e.g. \"firefox\", \"nautilus\").')" & ":" &
       "'Display name (e.g. \"Slack\") or bundle identifier (e.g. \"com.tinyspeck.slackmacgap\").')"
     if replaceLiteralFirst(content, old13d, new13d) == 1:
-      echo "  [OK] 13d open_application app: Linux identifiers"
+      echo "  [OK] 13d open_application app: 3-way Linux identifiers"
       inc descChanges
       inc patchesApplied
     else:
       echo "  [FAIL] 13d open_application app: not found"
+
+  # 13d2: open_application — drop the background/display-scope mode prose on
+  # Linux. Background app mode is the macOS app-scoped AX stack: its gate
+  # (`zk(){return process.platform!=="darwin"?!1:...}`) hard-fails off darwin,
+  # `getPreferredMode()` is undefined, and the app_* tools are never
+  # registered — so on Linux the two-mode explanation only describes tools the
+  # model does not have. Collapse it to the display-scope truth.
+  block:
+    let old13d2 =
+      "In background app mode, the launch does NOT bring it to the front " &
+      "\xe2\x80\x94 the user's focus is preserved and the app becomes reachable " &
+      "via the app_* tools. In display-scope mode, the app is brought to the front. "
+    let new13d2 =
+      "\"+(process.platform===\"linux\"?" &
+      "\"The app is brought to the front. \"" & ":" &
+      "\"In background app mode, the launch does NOT bring it to the front " &
+      "\xe2\x80\x94 the user's focus is preserved and the app becomes reachable " &
+      "via the app_* tools. In display-scope mode, the app is brought to the front. \")+\""
+    if replaceLiteralFirst(content, old13d2, new13d2) == 1:
+      echo "  [OK] 13d2 open_application: background/display-scope prose collapsed on Linux"
+      inc descChanges
+      inc patchesApplied
+    else:
+      echo "  [FAIL] 13d2 open_application mode prose: not found"
 
   # 13e: open_application description — no allowlist on Linux.
   # v1.21459.0 reworded the description (added background/display-scope prose);
@@ -982,13 +1019,15 @@ proc apply*(input: string): string =
   block:
     let old13e =
       "The target must already be in the session allowlist \xe2\x80\x94 call request_access first.\",inputSchema:"
+    # kwin mode keeps upstream's sentence: request_access is real there
+    # (upstream allowlist machinery, Patch 6 falls through).
     let new13e =
-      "\"+(process.platform===\"linux\"?" &
+      "\"+(process.platform===\"linux\"&&!globalThis.__cuKwinMode?" &
       "\"On Linux, all applications are directly accessible.\"" & ":" &
       "\"The target must already be in the session allowlist " &
       "\xe2\x80\x94 call request_access first.\"),inputSchema:"
     if replaceLiteralFirst(content, old13e, new13e) == 1:
-      echo "  [OK] 13e open_application: no allowlist on Linux"
+      echo "  [OK] 13e open_application: no allowlist on Linux (regular mode; kwin keeps upstream)"
       inc descChanges
       inc patchesApplied
     else:
@@ -1011,7 +1050,10 @@ proc apply*(input: string): string =
     else:
       echo "  [FAIL] 13f screenshot: not found"
 
-  # 13g: screenshot suffix — no allowlist error on Linux
+  # 13g: screenshot suffix — no allowlist error on regular-mode Linux only.
+  # The suffix concatenates onto ALL capability-selected screenshot description
+  # variants; in kwin mode upstream's empty-allowlist error path is live, so the
+  # sentence must stay.
   block:
     let pat =
       re"""([\w$]+)\+" Returns an error if the allowlist is empty\. The returned image is what subsequent click coordinates are relative to\.""""
@@ -1020,12 +1062,12 @@ proc apply*(input: string): string =
       pat,
       proc(m: RegexMatch): string =
         let v = m.captures[0]
-        &"{v}+(process.platform===\"linux\"" &
+        &"{v}+(process.platform===\"linux\"&&!globalThis.__cuKwinMode" &
           "?\" The returned image is what subsequent click coordinates are relative to.\"" &
           ":\" Returns an error if the allowlist is empty. The returned image is what subsequent click coordinates are relative to.\")",
     )
     if n >= 1:
-      echo "  [OK] 13g screenshot suffix: no allowlist error on Linux"
+      echo "  [OK] 13g screenshot suffix: no allowlist error on Linux (regular mode; kwin keeps upstream)"
       inc descChanges
       inc patchesApplied
     else:
@@ -1033,34 +1075,17 @@ proc apply*(input: string): string =
 
   if descChanges > 0:
     inc changes, descChanges
-    echo &"  [OK] {descChanges}/12 description patches applied (7 regular + 5 kwin-wayland KDE)"
+    echo &"  [OK] {descChanges}/13 description patches applied (8 regular + 5 kwin-wayland KDE)"
   else:
     echo "  [FAIL] No description patches applied (descriptions unchanged)"
 
   # ─── Patch 14: Linux-aware CU system prompt ──────────────────────────
-  # 14a: separate filesystems → 3-way same-filesystem wording (2 occurrences)
-  block:
-    let sepOldFull2 =
-      "**Separate filesystems.** Computer-use actions (clicks, typing, clipboard writes) happen on the user's real computer \xe2\x80\x94 a different system from your sandbox. "
-    let sepCount = countOccurrences(content, sepOldFull2)
-    if sepCount >= 2:
-      let sepNewFull =
-        "${process.platform===\"linux\"?(globalThis.__cuKwinMode" &
-        "?\"**Same filesystem.** Computer-use actions and your CLI tools operate on the same Linux machine. " &
-        "Files you create are directly accessible to desktop applications, and files selected or edited in " &
-        "desktop apps are on the same machine you can read from the CLI. " & "\"" &
-        ":\"**Same filesystem.** Computer-use actions and your CLI tools operate on the same Linux machine. " &
-        "There is no sandbox \\u2014 files you create are directly accessible to desktop applications and vice versa. " &
-        "\")" &
-        ":\"**Separate filesystems.** Computer-use actions (clicks, typing, clipboard writes) " &
-        "happen on the user's real computer \xe2\x80\x94 a different system from your sandbox. " &
-        "\"}"
-      discard replaceLiteralAll(content, sepOldFull2, sepNewFull)
-      echo &"  [OK] 14a separate filesystems: 3-way replace, {sepCount} occurrences"
-      inc changes, sepCount
-      inc patchesApplied
-    else:
-      echo &"  [FAIL] 14a separate filesystems: expected 2 occurrences, found {sepCount}"
+  # (There is no 14a anymore: the old "same filesystem, no sandbox" rewrite of
+  # upstream's "**Separate filesystems.**" paragraph dated from the
+  # pre-Cowork-VM era when the agent loop ran unsandboxed on the host. The
+  # official .deb runs Cowork in a VM — CLI tools operate on the VM filesystem,
+  # CU actions on the host desktop — so upstream's wording is simply correct
+  # and the patch was removed 2026-07-16.)
 
   # 14b: Finder/Photos/System Settings → generic Linux app terms
   block:
